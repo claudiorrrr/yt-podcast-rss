@@ -1,38 +1,49 @@
 # yt-podcast-rss
 
-Turn a YouTube playlist into a private audio podcast feed you can add to
-Overcast, Pocket Casts, or any app that takes a feed URL.
+Turn a YouTube playlist into a private podcast feed for Overcast, Pocket Casts
+or any app that takes a feed URL.
 
-Many shows publish only on YouTube. Podcast apps need an RSS feed with audio
-files, and a YouTube playlist feed has neither. This script downloads the
-audio with `yt-dlp`, writes `feed.xml`, and leaves serving to your web server.
-One Python file, no pip dependencies.
+It downloads the audio with `yt-dlp` and writes `feed.xml`. Your web server
+does the serving. One Python file, no pip dependencies.
 
-## Requirements
+## Example
 
-- Python 3.11+
-- `yt-dlp`, `ffmpeg`, `curl` on PATH (`brew install yt-dlp ffmpeg`)
-- A web server that can serve a folder over HTTPS (Caddy, nginx, ...)
+The playlist [Real Politik FC](https://www.youtube.com/playlist?list=PL97z6cpmRBbB2VAVGdWS38BgllG0K4idb)
+has no podcast feed. Config in `~/.config/yt-podcast-rss/config.toml`:
+
+```toml
+root = "~/Podcasts/k9x2-random-token"
+base_url = "https://podcast.example.com/k9x2-random-token"
+
+[feeds.real-politik-fc]
+playlist = "PL97z6cpmRBbB2VAVGdWS38BgllG0K4idb"
+title = "Real Politik FC"
+author = "El Orden Mundial x Panenka"
+category = "Sports"
+description = "Geopolitics and football."
+```
+
+Run it:
+
+```
+$ yt-podcast-rss
+[real-politik-fc] 7 public video(s)
+[real-politik-fc] 7 new, 0 failed, 7 episode(s) in feed -> https://podcast.example.com/k9x2-random-token/real-politik-fc/feed.xml
+```
+
+In Overcast: + > Add URL, paste that feed URL.
 
 ## Setup
 
+Needs Python 3.11+, `yt-dlp`, `ffmpeg`, `curl`.
+
 ```sh
-git clone https://github.com/<you>/yt-podcast-rss
-cd yt-podcast-rss
+brew install yt-dlp ffmpeg
 mkdir -p ~/.config/yt-podcast-rss
 cp config.example.toml ~/.config/yt-podcast-rss/config.toml
-$EDITOR ~/.config/yt-podcast-rss/config.toml
-./yt-podcast-rss
 ```
 
-Add `<base_url>/<slug>/feed.xml` to your podcast app (Overcast: + > Add URL).
-
-Run `./yt-podcast-rss my-show` to sync one feed, `-c path.toml` to use another
-config. Exit code is 1 if any download failed.
-
-## Serving
-
-Point a web server at `root`. Caddy:
+Serve `root`'s parent folder over HTTPS. Caddy:
 
 ```
 podcast.example.com {
@@ -41,56 +52,37 @@ podcast.example.com {
 }
 ```
 
-With `root = "~/Podcasts/<token>"` and `base_url = "https://podcast.example.com/<token>"`,
-the feed lands at `https://podcast.example.com/<token>/<slug>/feed.xml`.
-Do not enable directory listings. Audio must support HTTP range requests
-(Caddy and nginx do by default).
+The random token in the path is your only access control. Keep directory
+listings off.
 
-## Scheduling
+## Keep it updated
 
-The script skips episodes it already has, so run it as often as you like.
-
-cron:
+Existing episodes are skipped, so run it on a timer:
 
 ```
 0 */6 * * * /path/to/yt-podcast-rss
 ```
 
-macOS launchd (`~/Library/LaunchAgents/com.example.yt-podcast-rss.plist`):
+On macOS use launchd instead. It does not inherit your shell PATH, so set
+`PATH` to include `/opt/homebrew/bin` in the plist.
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.example.yt-podcast-rss</string>
-  <key>ProgramArguments</key><array><string>/path/to/yt-podcast-rss</string></array>
-  <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin</string></dict>
-  <key>StartInterval</key><integer>21600</integer>
-  <key>RunAtLoad</key><true/>
-</dict>
-</plist>
+## Usage
+
+```
+yt-podcast-rss [slug ...] [-c config.toml]
 ```
 
-Load it with `launchctl bootstrap gui/$(id -u) <plist>`. launchd does not
-inherit your shell PATH, hence the `PATH` entry.
+Exit code is 1 if any download failed. Optional feed keys (`language`,
+`cover_url`, `strip_suffix`) are in `config.example.toml`.
 
 ## Troubleshooting
 
-- `HTTP Error 403` or `Requested format is not available`: update yt-dlp
-  first (`brew upgrade yt-dlp`). YouTube changes break old versions often.
-- The script tries several YouTube player clients in order (`PLAYER_CLIENTS`)
-  and uses the first that works. Which one works changes over time.
-- Private and deleted videos are skipped.
-- Delete `<root>/<slug>/cover.jpg` to regenerate the cover.
+`HTTP Error 403` or `Requested format is not available`: run
+`brew upgrade yt-dlp`. YouTube breaks old versions often.
 
 ## Legal
 
-Downloading audio from YouTube may violate its Terms of Service. This is for
-personal use. Keep the feed URL private (random token in the path) and do not
-redistribute other people's content.
+Downloading from YouTube may violate its Terms of Service. Personal use only.
+Keep the feed private and do not redistribute other people's content.
 
-## License
-
-MIT
+MIT license.
