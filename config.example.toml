@@ -1,0 +1,22 @@
+# Copy to ~/.config/yt-podcast-rss/config.toml and edit.
+
+# Where audio and feeds are written on disk.
+root = "~/Podcasts/CHANGE-ME-random-token"
+
+# Public URL that maps to `root`. Keep a random token in the path: it is the
+# only thing stopping strangers from finding and downloading your feeds.
+base_url = "https://podcast.example.com/CHANGE-ME-random-token"
+
+# One table per playlist. The table name is the slug used in URLs:
+#   <base_url>/my-show/feed.xml
+[feeds.my-show]
+playlist = "PLxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"  # the list=... part of the URL
+title = "My Show"
+author = "Some Author"
+category = "Technology"  # Apple podcast category
+description = "What the show is about."
+
+# Optional.
+language = "en"                               # default "en"
+cover_url = "https://example.com/cover.jpg"   # default: newest video thumbnail
+strip_suffix = " | My Show"                   # trimmed from episode titles

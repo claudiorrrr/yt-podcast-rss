@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""Turn YouTube playlists into audio podcast RSS feeds served off disk.
+
+Downloads the audio track of every public video in a configured playlist,
+then regenerates an iTunes-flavoured RSS feed pointing at those files.
+Idempotent: already-downloaded episodes are skipped, so this is safe to run
+on a timer.
+
+Files land under <root>/<slug>/ which a web server exposes at
+<base_url>/<slug>/. See config.example.toml and README.md.
+
+     YouTube playlist
+           |  yt-dlp
+           v
+     <root>/<slug>/audio/*.m4a + *.info.json
+           |  this script
+           v
+     <root>/<slug>/feed.xml  ->  web server  ->  podcast app
+"""
+
+import argparse
+import datetime
+import enum
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tomllib
+from email.utils import formatdate
+from pathlib import Path
+from xml.sax.saxutils import escape, quoteattr
+
+DEFAULT_CONFIG = Path("~/.config/yt-podcast-rss/config.toml").expanduser()
+REQUIRED_TOOLS = ("yt-dlp", "ffmpeg", "curl")
+REQUIRED_SETTINGS = ("root", "base_url")
+REQUIRED_FEED_KEYS = ("playlist", "title", "author", "category", "description")
+DEFAULT_LANGUAGE = "en"
+
+COVER_PX = 1400
+MIN_IMAGE_BYTES = 1000
+DOWNLOAD_RETRIES = 5
+
+# Placeholder titles YouTube returns for entries we cannot fetch.
+HIDDEN_TITLES = (None, "NA", "[Private video]", "[Deleted video]")
+
+# Most YouTube clients now demand a GVS PO token and 403 without one.
+# android_vr still serves plain https audio; the others are fallbacks for
+# when YouTube inevitably changes this again.
+PLAYER_CLIENTS = ["android_vr", "web", "android", "tv_embedded"]
+
+
+class Fetch(enum.Enum):
+    FETCHED = "fetched"
+    CACHED = "cached"
+    FAILED = "failed"
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, check=False, text=True, capture_output=True, **kw)
+
+
+def check_tools():
+    missing = [t for t in REQUIRED_TOOLS if not shutil.which(t)]
+    if missing:
+        sys.exit(f"missing tools on PATH: {', '.join(missing)}")
+
+
+def load_config(path):
+    """Return (root, base_url, feeds) from the TOML config, or exit with a hint."""
+    if not path.exists():
+        sys.exit(f"config not found: {path} (start from config.example.toml)")
+
+    with path.open("rb") as fh:
+        cfg = tomllib.load(fh)
+
+    for key in REQUIRED_SETTINGS:
+        if key not in cfg:
+            sys.exit(f"{path}: missing top-level key '{key}'")
+
+    feeds = cfg.get("feeds") or {}
+    if not feeds:
+        sys.exit(f"{path}: no [feeds.<slug>] tables defined")
+
+    for slug, feed in feeds.items():
+        missing = [k for k in REQUIRED_FEED_KEYS if k not in feed]
+        if missing:
+            sys.exit(f"{path}: [feeds.{slug}] missing {', '.join(missing)}")
+
+    root = Path(cfg["root"]).expanduser()
+    return root, cfg["base_url"].rstrip("/"), feeds
+
+
+def playlist_entries(playlist_id):
+    """Return [(index, video_id)] for the public videos in the playlist."""
+    res = run([
+        "yt-dlp", "--flat-playlist", "--ignore-errors", "-J",
+        f"https://www.youtube.com/playlist?list={playlist_id}",
+    ])
+    if res.returncode != 0 and not res.stdout.strip():
+        sys.exit(f"yt-dlp could not read playlist {playlist_id}:\n{res.stderr}")
+
+    data = json.loads(res.stdout)
+    out = []
+    for i, e in enumerate(data.get("entries") or [], start=1):
+        # Private/deleted entries come back with no id or a placeholder title.
+        if not e or not e.get("id") or e.get("title") in HIDDEN_TITLES:
+            continue
+        out.append((i, e["id"]))
+    return out
+
+
+def download(video_id, audio_dir):
+    """Fetch the audio track + metadata for one video."""
+    target = audio_dir / f"{video_id}.m4a"
+    if target.exists():
+        return Fetch.CACHED
+
+    print(f"  downloading {video_id}", flush=True)
+    for client in PLAYER_CLIENTS:
+        res = run([
+            "yt-dlp",
+            "-f", "140/bestaudio[ext=m4a]/bestaudio",
+            "-x", "--audio-format", "m4a",
+            "--extractor-args", f"youtube:player_client={client}",
+            "--write-info-json",
+            "--no-playlist",
+            "--retries", str(DOWNLOAD_RETRIES),
+            "-o", str(audio_dir / "%(id)s.%(ext)s"),
+            f"https://www.youtube.com/watch?v={video_id}",
+        ])
+        if res.returncode == 0 and target.exists():
+            return Fetch.FETCHED
+
+        last = (res.stderr or "").strip().splitlines()[-1:] or [""]
+        print(f"    client={client} failed: {last[0][:120]}", flush=True)
+
+    print(f"  FAILED {video_id}", flush=True)
+    return Fetch.FAILED
+
+
+def ensure_cover(feed_dir, video_id, cover_url=None):
+    """Build a square cover, from cover_url if given else a video thumbnail.
+
+    Podcast apps want a square image; a 16:9 thumbnail is centered over a
+    blurred copy of itself so nothing gets cropped.
+    """
+    cover = feed_dir / "cover.jpg"
+    if cover.exists():
+        return
+
+    src = feed_dir / ".thumb.jpg"
+    sources = [cover_url] if cover_url else []
+    if video_id:
+        sources += [f"https://i.ytimg.com/vi/{video_id}/{n}.jpg"
+                    for n in ("maxresdefault", "hqdefault")]
+
+    for url in sources:
+        res = run(["curl", "-sfL", "-o", str(src), url])
+        if res.returncode == 0 and src.exists() and src.stat().st_size > MIN_IMAGE_BYTES:
+            break
+    else:
+        print("  no thumbnail available for cover", flush=True)
+        return
+
+    px = COVER_PX
+    run([
+        "ffmpeg", "-y", "-i", str(src),
+        "-vf",
+        f"split[a][b];[a]scale={px}:{px}:force_original_aspect_ratio=increase,"
+        f"crop={px}:{px},boxblur=40:2[bg];"
+        f"[b]scale={px}:{px}:force_original_aspect_ratio=decrease[fg];"
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2",
+        "-q:v", "2", str(cover),
+    ])
+    src.unlink(missing_ok=True)
+
+
+def load_info(audio_dir, video_id):
+    p = audio_dir / f"{video_id}.info.json"
+    if not p.exists():
+        return None
+    with p.open() as fh:
+        return json.load(fh)
+
+
+def upload_ts(info):
+    """Unix upload time, falling back to the upload date at midnight UTC."""
+    ts = info.get("timestamp")
+    if ts is not None:
+        return ts
+
+    d = info.get("upload_date")  # YYYYMMDD
+    if not d:
+        return 0
+
+    day = datetime.datetime(int(d[:4]), int(d[4:6]), int(d[6:8]),
+                            tzinfo=datetime.timezone.utc)
+    return int(day.timestamp())
+
+
+def build_feed(root, base_url, slug, cfg, entries):
+    feed_dir = root / slug
+    audio_dir = feed_dir / "audio"
+    feed_url = f"{base_url}/{slug}"
+
+    items = []
+    for _, vid in entries:
+        info = load_info(audio_dir, vid)
+        audio = audio_dir / f"{vid}.m4a"
+        if not info or not audio.exists():
+            continue
+
+        title = info.get("title") or vid
+        suffix = cfg.get("strip_suffix")
+        if suffix and title.endswith(suffix):
+            title = title[: -len(suffix)].strip()
+
+        items.append({
+            "id": vid,
+            "title": title,
+            "ts": upload_ts(info),
+            "duration": int(info.get("duration") or 0),
+            "size": audio.stat().st_size,
+            "desc": info.get("description") or "",
+        })
+
+    # Newest first, the way podcast clients expect.
+    items.sort(key=lambda i: i["ts"], reverse=True)
+
+    # CDNs cache images aggressively; version the URL so a regenerated
+    # cover actually reaches subscribers without a manual purge.
+    cover = feed_dir / "cover.jpg"
+    cover_url = f"{feed_url}/cover.jpg"
+    if cover.exists():
+        cover_url += f"?v={int(cover.stat().st_mtime)}"
+
+    e = escape
+    q = quoteattr
+    language = cfg.get("language", DEFAULT_LANGUAGE)
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" '
+        'xmlns:atom="http://www.w3.org/2005/Atom">',
+        "  <channel>",
+        f'    <title>{e(cfg["title"])}</title>',
+        f'    <link>https://www.youtube.com/playlist?list={cfg["playlist"]}</link>',
+        f'    <atom:link href={q(feed_url + "/feed.xml")} rel="self" type="application/rss+xml"/>',
+        f"    <language>{e(language)}</language>",
+        f'    <description>{e(cfg["description"])}</description>',
+        f'    <itunes:author>{e(cfg["author"])}</itunes:author>',
+        f'    <itunes:summary>{e(cfg["description"])}</itunes:summary>',
+        "    <itunes:explicit>false</itunes:explicit>",
+        f'    <itunes:category text={q(cfg["category"])}/>',
+        f"    <itunes:image href={q(cover_url)}/>",
+        f'    <lastBuildDate>{formatdate(items[0]["ts"] if items else 0, usegmt=True)}</lastBuildDate>',
+    ]
+    for it in items:
+        audio_url = f'{feed_url}/audio/{it["id"]}.m4a'
+        parts += [
+            "    <item>",
+            f'      <title>{e(it["title"])}</title>',
+            f'      <guid isPermaLink="false">{it["id"]}</guid>',
+            f'      <pubDate>{formatdate(it["ts"], usegmt=True)}</pubDate>',
+            f'      <enclosure url={q(audio_url)} length="{it["size"]}" type="audio/mp4"/>',
+            f'      <itunes:duration>{it["duration"]}</itunes:duration>',
+            f'      <link>https://www.youtube.com/watch?v={it["id"]}</link>',
+            f'      <description>{e(it["desc"])}</description>',
+            f'      <itunes:summary>{e(it["desc"])}</itunes:summary>',
+            "      <itunes:explicit>false</itunes:explicit>",
+            "    </item>",
+        ]
+    parts += ["  </channel>", "</rss>", ""]
+
+    # Write-then-rename so a podcast app never reads a half-written feed.
+    out = feed_dir / "feed.xml"
+    tmp = feed_dir / ".feed.xml.tmp"
+    tmp.write_text("\n".join(parts))
+    os.replace(tmp, out)
+    return len(items)
+
+
+def sync(root, base_url, slug, cfg):
+    """Sync one feed. Returns the number of failed downloads."""
+    feed_dir = root / slug
+    audio_dir = feed_dir / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"[{slug}] reading playlist {cfg['playlist']}", flush=True)
+    entries = playlist_entries(cfg["playlist"])
+    print(f"[{slug}] {len(entries)} public video(s)", flush=True)
+
+    results = [download(vid, audio_dir) for _, vid in entries]
+    new = results.count(Fetch.FETCHED)
+    failed = results.count(Fetch.FAILED)
+
+    if entries or cfg.get("cover_url"):
+        first = entries[0][1] if entries else None
+        ensure_cover(feed_dir, first, cfg.get("cover_url"))
+
+    count = build_feed(root, base_url, slug, cfg, entries)
+    print(f"[{slug}] {new} new, {failed} failed, {count} episode(s) in feed "
+          f"-> {base_url}/{slug}/feed.xml", flush=True)
+    return failed
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("feeds", nargs="*", help="feed slugs to sync (default: all)")
+    ap.add_argument("-c", "--config", type=Path, default=DEFAULT_CONFIG,
+                    help=f"config file (default: {DEFAULT_CONFIG})")
+    args = ap.parse_args()
+
+    check_tools()
+    root, base_url, feeds = load_config(args.config)
+
+    wanted = args.feeds or list(feeds)
+    unknown = [s for s in wanted if s not in feeds]
+    if unknown:
+        sys.exit(f"unknown feed: {', '.join(unknown)} (known: {', '.join(feeds)})")
+
+    failed = sum(sync(root, base_url, slug, feeds[slug]) for slug in wanted)
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()
